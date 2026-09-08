@@ -154,10 +154,12 @@ pub struct DeviceManager {
     hostname_bindings: Arc<Mutex<HashMap<[u8; 6], String>>>,
     neighbor_ipv4_online: Arc<Mutex<HashMap<[u8; 6], bool>>>,
     neighbor_initialized: Arc<AtomicBool>,
+    neighbor_uplinks: Arc<Mutex<HashMap<[u8; 6], String>>>,
     wifi_macs: Arc<Mutex<HashSet<[u8; 6]>>>,
     wired_macs: Arc<Mutex<HashSet<[u8; 6]>>>,
     bridge_port_map: Arc<Mutex<HashMap<[u8; 6], String>>>,
     wifi_channel_map: Arc<Mutex<HashMap<String, u32>>>,
+    wifi_frequency_map: Arc<Mutex<HashMap<String, u32>>>,
     exclude_iface_device: bool,
 }
 
@@ -177,10 +179,12 @@ impl DeviceManager {
             hostname_bindings,
             neighbor_ipv4_online: Arc::new(Mutex::new(HashMap::new())),
             neighbor_initialized: Arc::new(AtomicBool::new(false)),
+            neighbor_uplinks: Arc::new(Mutex::new(HashMap::new())),
             wifi_macs: Arc::new(Mutex::new(HashSet::new())),
             wired_macs: Arc::new(Mutex::new(HashSet::new())),
             bridge_port_map: Arc::new(Mutex::new(HashMap::new())),
             wifi_channel_map: Arc::new(Mutex::new(HashMap::new())),
+            wifi_frequency_map: Arc::new(Mutex::new(HashMap::new())),
             exclude_iface_device,
         }
     }
@@ -327,11 +331,25 @@ impl DeviceManager {
         }
 
         let already = self.neighbor_initialized.swap(true, Ordering::Relaxed);
+        let uplink_changes = track_uplink_changes(
+            &mut self.neighbor_uplinks.lock().unwrap(),
+            &old_ipv4_online,
+            &new_ipv4_online,
+            &self.get_bridge_port_map_snapshot(),
+        );
         if !already {
             return Ok(Vec::new());
         }
 
         let mut out = Vec::new();
+        for (mac, previous_uplink, uplink) in uplink_changes {
+            let ct = self.resolve_connection_type(&mac);
+            if let Some(mut payload) = self.build_neighbor_event_payload(&mac, "uplink_changed", now_ms, ct) {
+                payload.previous_uplink = Some(previous_uplink);
+                payload.uplink = uplink;
+                out.push(payload);
+            }
+        }
 
         for (mac, now_online) in new_ipv4_online.iter() {
             let prev_online = old_ipv4_online.get(mac).copied().unwrap_or(false);
@@ -612,6 +630,7 @@ impl DeviceManager {
         if removed {
             let mut neighbor = self.neighbor_ipv4_online.lock().unwrap();
             neighbor.remove(mac);
+            self.neighbor_uplinks.lock().unwrap().remove(mac);
         }
         removed
     }
@@ -759,6 +778,7 @@ impl DeviceManager {
         };
 
         let mut new_map: HashMap<String, u32> = HashMap::new();
+        let mut frequency_map: HashMap<String, u32> = HashMap::new();
         for member in members {
             if !member.contains("phy") && !member.contains("wlan") {
                 continue;
@@ -776,6 +796,9 @@ impl DeviceManager {
                                     }
                                 }
                             }
+                            if let Some(frequency) = parse_wifi_frequency(trimmed) {
+                                frequency_map.insert(member.clone(), frequency);
+                            }
                             break;
                         }
                     }
@@ -785,6 +808,8 @@ impl DeviceManager {
 
         let mut guard = self.wifi_channel_map.lock().unwrap();
         *guard = new_map;
+        drop(guard);
+        *self.wifi_frequency_map.lock().unwrap() = frequency_map;
     }
 
     fn read_all_neighbor_macs(&self) -> HashSet<[u8; 6]> {
@@ -878,6 +903,57 @@ struct NeighborEventPayload {
     ip: String,
     hostname: String,
     connection_type: String,
+    uplink: String,
+    wifi_channel: u32,
+    wifi_frequency_mhz: u32,
+    wifi_band: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_uplink: Option<String>,
+}
+
+// Keep the last known port while online: a missing FDB entry is not a move.
+// Reset after offline so reconnecting emits online, not an extra move event.
+fn track_uplink_changes(
+    known: &mut HashMap<[u8; 6], String>,
+    previous_online: &HashMap<[u8; 6], bool>,
+    online: &HashMap<[u8; 6], bool>,
+    ports: &HashMap<[u8; 6], String>,
+) -> Vec<([u8; 6], String, String)> {
+    known.retain(|mac, _| online.get(mac) == Some(&true));
+    let mut changes = Vec::new();
+    for (mac, is_online) in online {
+        if !is_online {
+            continue;
+        }
+        if previous_online.get(mac) != Some(&true) {
+            known.remove(mac);
+        }
+        if let Some(port) = ports.get(mac).filter(|port| !port.is_empty()) {
+            if let Some(old) = known.insert(*mac, port.clone()) {
+                if old != *port && previous_online.get(mac) == Some(&true) {
+                    changes.push((*mac, old, port.clone()));
+                }
+            }
+        }
+    }
+    changes
+}
+
+// iw reports e.g. "channel 36 (5180 MHz), width: 80 MHz, ...".
+fn parse_wifi_frequency(line: &str) -> Option<u32> {
+    let (_, rest) = line.split_once('(')?;
+    let (frequency, _) = rest.split_once(" MHz)")?;
+    frequency.trim().parse().ok()
+}
+
+fn wifi_band_from_frequency(frequency: u32) -> &'static str {
+    match frequency {
+        2400..=2500 => "2.4 GHz",
+        4900..=5924 => "5 GHz",
+        5925..=7125 => "6 GHz",
+        57000..=71000 => "60 GHz",
+        _ => "",
+    }
 }
 
 impl DeviceManager {
@@ -889,6 +965,14 @@ impl DeviceManager {
         connection_type: String,
     ) -> Option<NeighborEventPayload> {
         let device = self.get_device_by_mac(mac)?;
+        let uplink = self.bridge_port_map.lock().unwrap().get(mac).cloned().unwrap_or_default();
+        let (wifi_channel, wifi_frequency_mhz) = if connection_type == "wifi" {
+            let channel = self.wifi_channel_map.lock().unwrap().get(&uplink).copied().unwrap_or(0);
+            let frequency = self.wifi_frequency_map.lock().unwrap().get(&uplink).copied().unwrap_or(0);
+            (channel, frequency)
+        } else {
+            (0, 0)
+        };
         let ipv4 = device.get_current_ipv4();
         let ip = format!("{}.{}.{}.{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3]);
         Some(NeighborEventPayload {
@@ -898,6 +982,11 @@ impl DeviceManager {
             ip,
             hostname: device.hostname,
             connection_type,
+            uplink,
+            wifi_channel,
+            wifi_frequency_mhz,
+            wifi_band: wifi_band_from_frequency(wifi_frequency_mhz).to_string(),
+            previous_uplink: None,
         })
     }
 }
@@ -905,6 +994,88 @@ impl DeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uplink_tracking_handles_roaming_gaps_and_reconnects() {
+        let mac = [2, 0, 0, 0, 0, 2];
+        let online = HashMap::from([(mac, true)]);
+        let empty = HashMap::new();
+        let eth2 = HashMap::from([(mac, "eth2".to_string())]);
+        let eth3 = HashMap::from([(mac, "eth3".to_string())]);
+        let mut known = HashMap::new();
+        assert!(track_uplink_changes(&mut known, &empty, &online, &eth2).is_empty());
+        assert!(track_uplink_changes(&mut known, &online, &online, &eth2).is_empty());
+        assert!(track_uplink_changes(&mut known, &online, &online, &HashMap::new()).is_empty());
+        assert_eq!(track_uplink_changes(&mut known, &online, &online, &eth3), vec![(mac, "eth2".into(), "eth3".into())]);
+        assert!(track_uplink_changes(&mut known, &online, &online, &eth3).is_empty());
+        let offline = HashMap::from([(mac, false)]);
+        assert!(track_uplink_changes(&mut known, &online, &offline, &eth3).is_empty());
+        assert!(known.is_empty());
+        assert!(track_uplink_changes(&mut known, &offline, &online, &eth2).is_empty());
+        assert!(track_uplink_changes(&mut known, &online, &empty, &eth2).is_empty());
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn wifi_frequency_parsing_and_bands() {
+        for (line, frequency, band) in [
+            ("channel 1 (2412 MHz), width: 20 MHz", 2412, "2.4 GHz"),
+            ("channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz", 5180, "5 GHz"),
+            ("channel 1 (5955 MHz), width: 20 MHz", 5955, "6 GHz"),
+        ] {
+            assert_eq!(parse_wifi_frequency(line), Some(frequency));
+            assert_eq!(wifi_band_from_frequency(frequency), band);
+        }
+        assert_eq!(parse_wifi_frequency("channel 36"), None);
+        assert_eq!(parse_wifi_frequency("channel 36 (invalid MHz)"), None);
+        assert_eq!(wifi_band_from_frequency(0), "");
+    }
+
+    #[test]
+    fn event_payload_includes_uplink_and_radio_details() {
+        let manager = DeviceManager::new(
+            "br-lan".into(),
+            SubnetInfo {
+                interface_ip: [10, 10, 1, 1],
+                subnet_mask: [255, 255, 255, 0],
+                interface_mac: [2, 0, 0, 0, 0, 1],
+                ipv6_addresses: Vec::new(),
+            },
+            Vec::new(),
+            Arc::new(Mutex::new(HashMap::new())),
+            false,
+        );
+        let mac = [2, 0, 0, 0, 0, 2];
+        manager.devices.lock().unwrap().insert(mac, UnifiedDevice::new(mac));
+        for (interface, connection, channel, frequency, band) in [
+            ("eth2", "wired", 0, 0, ""),
+            ("eth3", "wired", 0, 0, ""),
+            ("phy0-ap0", "wifi", 1, 2412, "2.4 GHz"),
+            ("phy1-ap0", "wifi", 36, 5180, "5 GHz"),
+            ("phy2-ap0", "wifi", 1, 5955, "6 GHz"),
+        ] {
+            manager.bridge_port_map.lock().unwrap().insert(mac, interface.into());
+            manager.wifi_channel_map.lock().unwrap().insert(interface.into(), channel);
+            manager.wifi_frequency_map.lock().unwrap().insert(interface.into(), frequency);
+            for event in ["online", "offline"] {
+                let connection_type = manager.resolve_connection_type(&mac);
+                let payload = manager.build_neighbor_event_payload(&mac, event, 123, connection_type).unwrap();
+                let json = serde_json::to_value(payload).unwrap();
+                assert_eq!(json["event"], event);
+                assert_eq!(json["connection_type"], connection);
+                assert_eq!(json["uplink"], interface);
+                assert_eq!(json["wifi_channel"], channel);
+                assert_eq!(json["wifi_frequency_mhz"], frequency);
+                assert_eq!(json["wifi_band"], band);
+            }
+        }
+        manager.bridge_port_map.lock().unwrap().clear();
+        let payload = manager.build_neighbor_event_payload(&mac, "offline", 123, "wifi".into()).unwrap();
+        assert_eq!(payload.uplink, "");
+        assert_eq!(payload.wifi_channel, 0);
+        assert_eq!(payload.wifi_frequency_mhz, 0);
+        assert_eq!(payload.wifi_band, "");
+    }
 
     #[test]
     fn test_is_special_mac_address() {
